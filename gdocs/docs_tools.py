@@ -9,6 +9,7 @@ import asyncio
 import io
 from typing import List, Dict, Any, Optional
 
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # Auth & server utilities
@@ -123,15 +124,31 @@ async def get_doc_content(
     )
 
     # Step 2: Get file metadata from Drive
-    file_metadata = await asyncio.to_thread(
-        drive_service.files()
-        .get(
-            fileId=document_id,
-            fields="id, name, mimeType, webViewLink",
-            supportsAllDrives=True,
+    try:
+        file_metadata = await asyncio.to_thread(
+            drive_service.files()
+            .get(
+                fileId=document_id,
+                fields="id, name, mimeType, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
         )
-        .execute
-    )
+    except HttpError as error:
+        # Aize: without drive.readonly (a restricted scope, not requested) Drive only sees the
+        # files this app created or the user picked, and answers 404 for the rest. A Doc the
+        # user names is still readable through the Docs API with the `documents` scope.
+        if error.resp.status not in (403, 404):
+            raise
+        logger.info(
+            f"[get_doc_content] Drive cannot see {document_id} ({error.resp.status}); "
+            "reading it as a Google Doc through the Docs API."
+        )
+        file_metadata = {
+            "name": None,
+            "mimeType": "application/vnd.google-apps.document",
+            "webViewLink": f"https://docs.google.com/document/d/{document_id}/edit",
+        }
     mime_type = file_metadata.get("mimeType", "")
     file_name = file_metadata.get("name", "Unknown File")
     web_view_link = file_metadata.get("webViewLink", "#")
@@ -150,6 +167,7 @@ async def get_doc_content(
             .get(documentId=document_id, includeTabsContent=True)
             .execute
         )
+        file_name = file_name or doc_data.get("title", "Unknown File")
         # Tab header format constant
         TAB_HEADER_FORMAT = "\n--- TAB: {tab_name} ---\n"
 
