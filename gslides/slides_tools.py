@@ -6,7 +6,7 @@ This module provides MCP tools for interacting with Google Slides API.
 
 import logging
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 from auth.service_decorator import require_google_service
@@ -21,21 +21,28 @@ logger = logging.getLogger(__name__)
 @handle_http_errors("create_presentation", service_type="slides")
 @require_google_service("slides", "slides")
 async def create_presentation(
-    service, user_google_email: str, title: str = "Untitled Presentation"
+    service,
+    user_google_email: str,
+    title: str = "Untitled Presentation",
+    slides: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
-    Create a new Google Slides presentation.
+    Create a new Google Slides presentation, optionally with titled slides.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         title (str): The title for the new presentation. Defaults to "Untitled Presentation".
+        slides (List[Dict[str, str]]): Optional slides in order, each {"title": "...", "body": "..."}
+            ("body" optional). Use this to create a deck with text instead of batch_update_presentation.
 
     Returns:
         str: Details about the created presentation including ID and URL.
     """
     logger.info(
-        f"[create_presentation] Invoked. Email: '{user_google_email}', Title: '{title}'"
+        f"[create_presentation] Invoked. Email: '{user_google_email}', Title: '{title}', Slides: {len(slides or [])}"
     )
+
+    requests = _slide_requests(slides) if slides else []
 
     body = {"title": title}
 
@@ -43,15 +50,78 @@ async def create_presentation(
 
     presentation_id = result.get("presentationId")
     presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+    slide_count = len(result.get("slides", []))
+
+    if requests:
+        # The new deck starts with one blank title slide; the requested slides replace it.
+        requests += [
+            {"deleteObject": {"objectId": s["objectId"]}}
+            for s in result.get("slides", [])
+            if s.get("objectId")
+        ]
+        await asyncio.to_thread(
+            service.presentations()
+            .batchUpdate(presentationId=presentation_id, body={"requests": requests})
+            .execute
+        )
+        slide_count = len(slides)
 
     confirmation_message = f"""Presentation Created Successfully for {user_google_email}:
 - Title: {title}
 - Presentation ID: {presentation_id}
 - URL: {presentation_url}
-- Slides: {len(result.get("slides", []))} slide(s) created"""
+- Slides: {slide_count} slide(s) created"""
+    for i, s in enumerate(slides or [], 1):
+        confirmation_message += f"\n  Slide {i}: {s.get('title', '')}"
 
     logger.info(f"Presentation created successfully for {user_google_email}")
     return confirmation_message
+
+
+MAX_SLIDES_ON_CREATE = 20
+
+
+def _slide_requests(slides: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Valid batchUpdate requests for titled slides.
+
+    Models asked to write slide text through batch_update_presentation invent request
+    shapes ("pageObjectId", "createParagraphStyle", insertion past the end) and Google
+    answers 400. Here the layout placeholders get ids we choose, so the text lands in them.
+    """
+    if not isinstance(slides, list) or not slides:
+        raise ValueError("slides must be a non-empty list of {'title': ..., 'body': ...}")
+    if len(slides) > MAX_SLIDES_ON_CREATE:
+        raise ValueError(f"At most {MAX_SLIDES_ON_CREATE} slides can be created at once.")
+
+    requests: List[Dict[str, Any]] = []
+    for i, slide in enumerate(slides):
+        if not isinstance(slide, dict):
+            raise ValueError(f"Slide {i + 1} must be an object with 'title' and optional 'body'.")
+        slide_title = str(slide.get("title") or "")
+        slide_body = str(slide.get("body") or "")
+        slide_id, title_id, body_id = f"aize_s{i}", f"aize_s{i}_title", f"aize_s{i}_body"
+        mappings = [{"layoutPlaceholder": {"type": "TITLE", "index": 0}, "objectId": title_id}]
+        if slide_body:
+            mappings.append(
+                {"layoutPlaceholder": {"type": "BODY", "index": 0}, "objectId": body_id}
+            )
+        requests.append(
+            {
+                "createSlide": {
+                    "objectId": slide_id,
+                    "slideLayoutReference": {
+                        "predefinedLayout": "TITLE_AND_BODY" if slide_body else "TITLE_ONLY"
+                    },
+                    "placeholderIdMappings": mappings,
+                }
+            }
+        )
+        # insertText rejects empty text, so an empty title stays an empty placeholder.
+        if slide_title:
+            requests.append({"insertText": {"objectId": title_id, "text": slide_title}})
+        if slide_body:
+            requests.append({"insertText": {"objectId": body_id, "text": slide_body}})
+    return requests
 
 
 @server.tool()
@@ -129,8 +199,20 @@ async def get_presentation(
             logger.warning(f"Failed to extract text from the slide {slide_id}: {e}")
             slide_text = f"<failed to extract text: {type(e)}, {e}>"
 
+        # Element ids (and placeholder types) are what insertText and deleteText target.
+        element_ids = ", ".join(
+            pe.get("objectId", "?")
+            + (
+                f" ({pe['shape']['placeholder'].get('type')})"
+                if pe.get("shape", {}).get("placeholder")
+                else ""
+            )
+            for pe in page_elements
+        )
         slides_info.append(
-            f"  Slide {i}: ID {slide_id}, {len(page_elements)} element(s), text: {slide_text if slide_text else 'empty'}"
+            f"  Slide {i}: ID {slide_id}, {len(page_elements)} element(s)"
+            + (f" [{element_ids}]" if element_ids else "")
+            + f", text: {slide_text if slide_text else 'empty'}"
         )
 
     confirmation_message = f"""Presentation Details for {user_google_email}:
@@ -158,6 +240,10 @@ async def batch_update_presentation(
 ) -> str:
     """
     Apply batch updates to a Google Slides presentation.
+
+    Requests are raw Slides API requests and must match its schema exactly. To create a deck
+    with titled slides, use create_presentation(slides=[...]) instead. Element and placeholder
+    ids for insertText come from get_presentation.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
