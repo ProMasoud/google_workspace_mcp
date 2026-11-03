@@ -14,7 +14,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
-from core.utils import extract_office_xml_text, handle_http_errors
+from core.utils import handle_http_errors
 from core.server import server
 from core.comments import create_comment_tools
 
@@ -95,199 +95,121 @@ async def search_docs(
 
 @server.tool()
 @handle_http_errors("get_doc_content", is_read_only=True, service_type="docs")
-@require_multiple_services(
-    [
-        {
-            "service_type": "drive",
-            "scopes": "drive_read",
-            "param_name": "drive_service",
-        },
-        {"service_type": "docs", "scopes": "docs_read", "param_name": "docs_service"},
-    ]
-)
+@require_google_service("docs", "docs_read")
 async def get_doc_content(
-    drive_service: Any,
-    docs_service: Any,
+    service: Any,
     user_google_email: str,
     document_id: str,
 ) -> str:
     """
-    Retrieves content of a Google Doc or a Drive file (like .docx) identified by document_id.
-    - Native Google Docs: Fetches content via Docs API.
-    - Office files (.docx, etc.) stored in Drive: Downloads via Drive API and extracts text.
+    Retrieves the text of a Google Doc identified by document_id, including all tabs.
+
+    Aize: reads through the Docs API only. The `documents` scope covers any Doc the user can
+    open; Drive (drive.readonly, a restricted scope) is not requested, and the `/docs` server
+    does not enable the Drive tools. Office files stored in Drive (.docx) are not Google Docs
+    and cannot be read here.
 
     Returns:
         str: The document content with metadata header.
     """
     logger.info(
-        f"[get_doc_content] Invoked. Document/File ID: '{document_id}' for user '{user_google_email}'"
+        f"[get_doc_content] Invoked. Document ID: '{document_id}' for user '{user_google_email}'"
     )
 
-    # Step 2: Get file metadata from Drive
     try:
-        file_metadata = await asyncio.to_thread(
-            drive_service.files()
-            .get(
-                fileId=document_id,
-                fields="id, name, mimeType, webViewLink",
-                supportsAllDrives=True,
-            )
-            .execute
-        )
-    except HttpError as error:
-        # Aize: without drive.readonly (a restricted scope, not requested) Drive only sees the
-        # files this app created or the user picked, and answers 404 for the rest. A Doc the
-        # user names is still readable through the Docs API with the `documents` scope.
-        if error.resp.status not in (403, 404):
-            raise
-        logger.info(
-            f"[get_doc_content] Drive cannot see {document_id} ({error.resp.status}); "
-            "reading it as a Google Doc through the Docs API."
-        )
-        file_metadata = {
-            "name": None,
-            "mimeType": "application/vnd.google-apps.document",
-            "webViewLink": f"https://docs.google.com/document/d/{document_id}/edit",
-        }
-    mime_type = file_metadata.get("mimeType", "")
-    file_name = file_metadata.get("name", "Unknown File")
-    web_view_link = file_metadata.get("webViewLink", "#")
-
-    logger.info(
-        f"[get_doc_content] File '{file_name}' (ID: {document_id}) has mimeType: '{mime_type}'"
-    )
-
-    body_text = ""  # Initialize body_text
-
-    # Step 3: Process based on mimeType
-    if mime_type == "application/vnd.google-apps.document":
-        logger.info("[get_doc_content] Processing as native Google Doc.")
         doc_data = await asyncio.to_thread(
-            docs_service.documents()
+            service.documents()
             .get(documentId=document_id, includeTabsContent=True)
             .execute
         )
-        file_name = file_name or doc_data.get("title", "Unknown File")
-        # Tab header format constant
-        TAB_HEADER_FORMAT = "\n--- TAB: {tab_name} ---\n"
-
-        def extract_text_from_elements(elements, tab_name=None, depth=0):
-            """Extract text from document elements (paragraphs, tables, etc.)"""
-            # Prevent infinite recursion by limiting depth
-            if depth > 5:
-                return ""
-            text_lines = []
-            if tab_name:
-                text_lines.append(TAB_HEADER_FORMAT.format(tab_name=tab_name))
-
-            for element in elements:
-                if "paragraph" in element:
-                    paragraph = element.get("paragraph", {})
-                    para_elements = paragraph.get("elements", [])
-                    current_line_text = ""
-                    for pe in para_elements:
-                        text_run = pe.get("textRun", {})
-                        if text_run and "content" in text_run:
-                            current_line_text += text_run["content"]
-                    if current_line_text.strip():
-                        text_lines.append(current_line_text)
-                elif "table" in element:
-                    # Handle table content
-                    table = element.get("table", {})
-                    table_rows = table.get("tableRows", [])
-                    for row in table_rows:
-                        row_cells = row.get("tableCells", [])
-                        for cell in row_cells:
-                            cell_content = cell.get("content", [])
-                            cell_text = extract_text_from_elements(
-                                cell_content, depth=depth + 1
-                            )
-                            if cell_text.strip():
-                                text_lines.append(cell_text)
-            return "".join(text_lines)
-
-        def process_tab_hierarchy(tab, level=0):
-            """Process a tab and its nested child tabs recursively"""
-            tab_text = ""
-
-            if "documentTab" in tab:
-                props = tab.get("tabProperties", {})
-                tab_title = props.get("title", "Untitled Tab")
-                tab_id = props.get("tabId", "Unknown ID")
-                # Add indentation for nested tabs to show hierarchy
-                if level > 0:
-                    tab_title = "    " * level + f"{tab_title} ( ID: {tab_id})"
-                tab_body = tab.get("documentTab", {}).get("body", {}).get("content", [])
-                tab_text += extract_text_from_elements(tab_body, tab_title)
-
-            # Process child tabs (nested tabs)
-            child_tabs = tab.get("childTabs", [])
-            for child_tab in child_tabs:
-                tab_text += process_tab_hierarchy(child_tab, level + 1)
-
-            return tab_text
-
-        processed_text_lines = []
-
-        # Process main document body
-        body_elements = doc_data.get("body", {}).get("content", [])
-        main_content = extract_text_from_elements(body_elements)
-        if main_content.strip():
-            processed_text_lines.append(main_content)
-
-        # Process all tabs
-        tabs = doc_data.get("tabs", [])
-        for tab in tabs:
-            tab_content = process_tab_hierarchy(tab)
-            if tab_content.strip():
-                processed_text_lines.append(tab_content)
-
-        body_text = "".join(processed_text_lines)
-    else:
-        logger.info(
-            f"[get_doc_content] Processing as Drive file (e.g., .docx, other). MimeType: {mime_type}"
+    except HttpError as error:
+        if error.resp.status != 400:
+            raise
+        return (
+            f"Document {document_id} is not a Google Doc (for example, a .docx file stored in "
+            "Drive), so it cannot be read. Ask the user to open it in Google Docs, choose "
+            "File > Save as Google Docs, and share the new link."
         )
 
-        export_mime_type_map = {
-            # Example: "application/vnd.google-apps.spreadsheet"z: "text/csv",
-            # Native GSuite types that are not Docs would go here if this function
-            # was intended to export them. For .docx, direct download is used.
-        }
-        effective_export_mime = export_mime_type_map.get(mime_type)
+    file_name = doc_data.get("title", "Unknown File")
+    mime_type = "application/vnd.google-apps.document"
+    web_view_link = f"https://docs.google.com/document/d/{document_id}/edit"
 
-        request_obj = (
-            drive_service.files().export_media(
-                fileId=document_id,
-                mimeType=effective_export_mime,
-                supportsAllDrives=True,
-            )
-            if effective_export_mime
-            else drive_service.files().get_media(
-                fileId=document_id, supportsAllDrives=True
-            )
-        )
+    # Tab header format constant
+    TAB_HEADER_FORMAT = "\n--- TAB: {tab_name} ---\n"
 
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_obj)
-        loop = asyncio.get_event_loop()
-        done = False
-        while not done:
-            status, done = await loop.run_in_executor(None, downloader.next_chunk)
+    def extract_text_from_elements(elements, tab_name=None, depth=0):
+        """Extract text from document elements (paragraphs, tables, etc.)"""
+        # Prevent infinite recursion by limiting depth
+        if depth > 5:
+            return ""
+        text_lines = []
+        if tab_name:
+            text_lines.append(TAB_HEADER_FORMAT.format(tab_name=tab_name))
 
-        file_content_bytes = fh.getvalue()
+        for element in elements:
+            if "paragraph" in element:
+                paragraph = element.get("paragraph", {})
+                para_elements = paragraph.get("elements", [])
+                current_line_text = ""
+                for pe in para_elements:
+                    text_run = pe.get("textRun", {})
+                    if text_run and "content" in text_run:
+                        current_line_text += text_run["content"]
+                if current_line_text.strip():
+                    text_lines.append(current_line_text)
+            elif "table" in element:
+                # Handle table content
+                table = element.get("table", {})
+                table_rows = table.get("tableRows", [])
+                for row in table_rows:
+                    row_cells = row.get("tableCells", [])
+                    for cell in row_cells:
+                        cell_content = cell.get("content", [])
+                        cell_text = extract_text_from_elements(
+                            cell_content, depth=depth + 1
+                        )
+                        if cell_text.strip():
+                            text_lines.append(cell_text)
+        return "".join(text_lines)
 
-        office_text = extract_office_xml_text(file_content_bytes, mime_type)
-        if office_text:
-            body_text = office_text
-        else:
-            try:
-                body_text = file_content_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                body_text = (
-                    f"[Binary or unsupported text encoding for mimeType '{mime_type}' - "
-                    f"{len(file_content_bytes)} bytes]"
-                )
+    def process_tab_hierarchy(tab, level=0):
+        """Process a tab and its nested child tabs recursively"""
+        tab_text = ""
 
+        if "documentTab" in tab:
+            props = tab.get("tabProperties", {})
+            tab_title = props.get("title", "Untitled Tab")
+            tab_id = props.get("tabId", "Unknown ID")
+            # Add indentation for nested tabs to show hierarchy
+            if level > 0:
+                tab_title = "    " * level + f"{tab_title} ( ID: {tab_id})"
+            tab_body = tab.get("documentTab", {}).get("body", {}).get("content", [])
+            tab_text += extract_text_from_elements(tab_body, tab_title)
+
+        # Process child tabs (nested tabs)
+        child_tabs = tab.get("childTabs", [])
+        for child_tab in child_tabs:
+            tab_text += process_tab_hierarchy(child_tab, level + 1)
+
+        return tab_text
+
+    processed_text_lines = []
+
+    # Process main document body
+    body_elements = doc_data.get("body", {}).get("content", [])
+    main_content = extract_text_from_elements(body_elements)
+    if main_content.strip():
+        processed_text_lines.append(main_content)
+
+    # Process all tabs
+    tabs = doc_data.get("tabs", [])
+    for tab in tabs:
+        tab_content = process_tab_hierarchy(tab)
+        if tab_content.strip():
+            processed_text_lines.append(tab_content)
+
+    body_text = "".join(processed_text_lines)
     header = (
         f'File: "{file_name}" (ID: {document_id}, Type: {mime_type})\n'
         f"Link: {web_view_link}\n\n--- CONTENT ---\n"
