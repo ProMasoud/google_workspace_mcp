@@ -25,6 +25,51 @@ from core.server import server
 logger = logging.getLogger(__name__)
 
 
+_OFFSET_SUFFIX = re.compile(r"(Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+
+
+def _is_naive_datetime(value: str) -> bool:
+    """True for an RFC3339 date-time with neither 'Z' nor a UTC offset (e.g. "2026-11-04T10:00:00")."""
+    return "T" in value and not _OFFSET_SUFFIX.search(value.strip())
+
+
+async def _calendar_time_zone(service, calendar_id: str) -> Optional[str]:
+    """The calendar's own IANA time zone, or None when it cannot be read."""
+    try:
+        cal = await asyncio.to_thread(
+            service.calendars().get(calendarId=calendar_id).execute
+        )
+    except Exception as e:  # noqa: BLE001 - any failure falls back to UTC
+        logger.warning(f"[calendar] Could not read the time zone of '{calendar_id}': {e}")
+        return None
+    return cal.get("timeZone") or None
+
+
+async def _fill_missing_time_zone(
+    service, calendar_id: str, event_body: Dict[str, Any], tool_name: str
+) -> None:
+    """
+    Aize: Google rejects a date-time without an offset unless the event names a time zone
+    ("Missing time zone definition for start time"). Models often send local wall-clock times,
+    which cost the user a string of failed calls. Read such times in the calendar's own time
+    zone (what the Calendar UI does), falling back to UTC when it cannot be read.
+    """
+    naive = [
+        part
+        for part in ("start", "end")
+        if isinstance(event_body.get(part), dict)
+        and "dateTime" in event_body[part]
+        and "timeZone" not in event_body[part]
+        and _is_naive_datetime(event_body[part]["dateTime"])
+    ]
+    if not naive:
+        return
+    tz = await _calendar_time_zone(service, calendar_id) or "UTC"
+    for part in naive:
+        event_body[part]["timeZone"] = tz
+    logger.info(f"[{tool_name}] No offset on {', '.join(naive)}; using time zone {tz}")
+
+
 def _parse_reminders_json(
     reminders_input: Optional[Union[str, List[Dict[str, Any]]]], function_name: str
 ) -> List[Dict[str, Any]]:
@@ -602,6 +647,7 @@ async def create_event(
             event_body["start"]["timeZone"] = timezone
         if "dateTime" in event_body["end"]:
             event_body["end"]["timeZone"] = timezone
+    await _fill_missing_time_zone(service, calendar_id, event_body, "create_event")
     if attendees:
         event_body["attendees"] = [{"email": email} for email in attendees]
 
@@ -807,6 +853,7 @@ async def modify_event(
         )
         if timezone is not None and "dateTime" in event_body["end"]:
             event_body["end"]["timeZone"] = timezone
+    await _fill_missing_time_zone(service, calendar_id, event_body, "modify_event")
     if description is not None:
         event_body["description"] = description
     if location is not None:
