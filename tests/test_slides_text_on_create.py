@@ -11,6 +11,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import httplib2
+from googleapiclient.errors import HttpError
+
+from core.utils import UserInputError
 from gslides import slides_tools
 
 
@@ -64,7 +68,10 @@ async def test_titled_slides_land_in_placeholders_and_the_blank_slide_goes():
 
     # Text goes into the placeholder ids the same request assigned.
     title_id = first["placeholderIdMappings"][0]["objectId"]
-    assert requests[1]["insertText"] == {"objectId": title_id, "text": "Team workspace launch"}
+    assert requests[1]["insertText"] == {
+        "objectId": title_id,
+        "text": "Team workspace launch",
+    }
     body_map = second["placeholderIdMappings"][1]
     assert body_map["layoutPlaceholder"] == {"type": "BODY", "index": 0}
     assert requests[4]["insertText"] == {
@@ -109,11 +116,41 @@ async def test_an_empty_title_is_not_sent_as_empty_insert_text():
 
 
 @pytest.mark.parametrize(
-    "slides", [[], "Team workspace launch", ["Team workspace launch"], [{"title": "x"}] * 21]
+    "slides",
+    [[], "Team workspace launch", ["Team workspace launch"], [{"title": "x"}] * 21],
 )
-def test_bad_slide_lists_are_refused_before_anything_is_created(slides):
-    with pytest.raises(ValueError):
-        slides_tools._slide_requests(slides)
+@pytest.mark.asyncio
+async def test_bad_slide_lists_are_refused_before_anything_is_created(slides):
+    service = _service()
+
+    with pytest.raises(UserInputError):
+        await _undecorated(slides_tools.create_presentation)(
+            service=service,
+            user_google_email="demo@example.com",
+            title="Deck",
+            slides=slides,
+        )
+
+    service.presentations().create().execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_slide_write_names_the_deck_instead_of_failing_blind():
+    service = _service()
+    service.presentations().batchUpdate().execute.side_effect = HttpError(
+        httplib2.Response({"status": 400}), b'{"error": {"message": "bad request"}}'
+    )
+
+    result = await _undecorated(slides_tools.create_presentation)(
+        service=service,
+        user_google_email="demo@example.com",
+        title="Deck",
+        slides=[{"title": "One", "body": None}],
+    )
+
+    assert "slides could not be written" in result
+    assert "https://docs.google.com/presentation/d/deck1/edit" in result
+    assert "do not create another one" in result
 
 
 @pytest.mark.asyncio
@@ -129,7 +166,9 @@ async def test_get_presentation_names_the_placeholder_ids():
                         "objectId": "aize_s0_title",
                         "shape": {
                             "placeholder": {"type": "TITLE"},
-                            "text": {"textElements": [{"textRun": {"content": "Launch\n"}}]},
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Launch\n"}}]
+                            },
                         },
                     }
                 ],

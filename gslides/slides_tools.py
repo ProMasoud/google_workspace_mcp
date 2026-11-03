@@ -8,10 +8,12 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 
+from googleapiclient.errors import HttpError
+
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import handle_http_errors
+from core.utils import UserInputError, handle_http_errors
 from core.comments import create_comment_tools
 
 logger = logging.getLogger(__name__)
@@ -24,7 +26,7 @@ async def create_presentation(
     service,
     user_google_email: str,
     title: str = "Untitled Presentation",
-    slides: Optional[List[Dict[str, str]]] = None,
+    slides: Optional[List[Dict[str, Optional[str]]]] = None,
 ) -> str:
     """
     Create a new Google Slides presentation, optionally with titled slides.
@@ -42,7 +44,7 @@ async def create_presentation(
         f"[create_presentation] Invoked. Email: '{user_google_email}', Title: '{title}', Slides: {len(slides or [])}"
     )
 
-    requests = _slide_requests(slides) if slides else []
+    requests = _slide_requests(slides) if slides is not None else []
 
     body = {"title": title}
 
@@ -59,11 +61,27 @@ async def create_presentation(
             for s in result.get("slides", [])
             if s.get("objectId")
         ]
-        await asyncio.to_thread(
-            service.presentations()
-            .batchUpdate(presentationId=presentation_id, body={"requests": requests})
-            .execute
-        )
+        try:
+            await asyncio.to_thread(
+                service.presentations()
+                .batchUpdate(
+                    presentationId=presentation_id, body={"requests": requests}
+                )
+                .execute
+            )
+        except HttpError as error:
+            if error.resp.status != 400:
+                raise
+            # The deck exists; say so, so a retry edits it instead of creating another one.
+            logger.error(
+                f"[create_presentation] Slides not written to {presentation_id}: {error}"
+            )
+            return f"""Presentation created for {user_google_email}, but its slides could not be written:
+- Title: {title}
+- Presentation ID: {presentation_id}
+- URL: {presentation_url}
+- Error: {error}
+Edit this presentation with batch_update_presentation; do not create another one."""
         slide_count = len(slides)
 
     confirmation_message = f"""Presentation Created Successfully for {user_google_email}:
@@ -72,7 +90,7 @@ async def create_presentation(
 - URL: {presentation_url}
 - Slides: {slide_count} slide(s) created"""
     for i, s in enumerate(slides or [], 1):
-        confirmation_message += f"\n  Slide {i}: {s.get('title', '')}"
+        confirmation_message += f"\n  Slide {i}: {s.get('title') or ''}"
 
     logger.info(f"Presentation created successfully for {user_google_email}")
     return confirmation_message
@@ -81,7 +99,7 @@ async def create_presentation(
 MAX_SLIDES_ON_CREATE = 20
 
 
-def _slide_requests(slides: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def _slide_requests(slides: List[Dict[str, Optional[str]]]) -> List[Dict[str, Any]]:
     """Valid batchUpdate requests for titled slides.
 
     Models asked to write slide text through batch_update_presentation invent request
@@ -89,18 +107,30 @@ def _slide_requests(slides: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     answers 400. Here the layout placeholders get ids we choose, so the text lands in them.
     """
     if not isinstance(slides, list) or not slides:
-        raise ValueError("slides must be a non-empty list of {'title': ..., 'body': ...}")
+        raise UserInputError(
+            "slides must be a non-empty list of {'title': ..., 'body': ...}"
+        )
     if len(slides) > MAX_SLIDES_ON_CREATE:
-        raise ValueError(f"At most {MAX_SLIDES_ON_CREATE} slides can be created at once.")
+        raise UserInputError(
+            f"At most {MAX_SLIDES_ON_CREATE} slides can be created at once."
+        )
 
     requests: List[Dict[str, Any]] = []
     for i, slide in enumerate(slides):
         if not isinstance(slide, dict):
-            raise ValueError(f"Slide {i + 1} must be an object with 'title' and optional 'body'.")
+            raise UserInputError(
+                f"Slide {i + 1} must be an object with 'title' and optional 'body'."
+            )
         slide_title = str(slide.get("title") or "")
         slide_body = str(slide.get("body") or "")
-        slide_id, title_id, body_id = f"aize_s{i}", f"aize_s{i}_title", f"aize_s{i}_body"
-        mappings = [{"layoutPlaceholder": {"type": "TITLE", "index": 0}, "objectId": title_id}]
+        slide_id, title_id, body_id = (
+            f"aize_s{i}",
+            f"aize_s{i}_title",
+            f"aize_s{i}_body",
+        )
+        mappings = [
+            {"layoutPlaceholder": {"type": "TITLE", "index": 0}, "objectId": title_id}
+        ]
         if slide_body:
             mappings.append(
                 {"layoutPlaceholder": {"type": "BODY", "index": 0}, "objectId": body_id}
@@ -110,7 +140,9 @@ def _slide_requests(slides: List[Dict[str, str]]) -> List[Dict[str, Any]]:
                 "createSlide": {
                     "objectId": slide_id,
                     "slideLayoutReference": {
-                        "predefinedLayout": "TITLE_AND_BODY" if slide_body else "TITLE_ONLY"
+                        "predefinedLayout": "TITLE_AND_BODY"
+                        if slide_body
+                        else "TITLE_ONLY"
                     },
                     "placeholderIdMappings": mappings,
                 }
