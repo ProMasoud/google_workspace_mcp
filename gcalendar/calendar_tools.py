@@ -34,15 +34,23 @@ def _is_naive_datetime(value: str) -> bool:
 
 
 async def _calendar_time_zone(service, calendar_id: str) -> Optional[str]:
-    """The calendar's own IANA time zone, or None when it cannot be read."""
+    """
+    The calendar's own IANA time zone, or None when it cannot be read.
+
+    Read from events.list (its response carries the calendar's `timeZone`), which the
+    calendar.events scope allows; calendars.get would need calendar.readonly, which a user may
+    untick on Google's consent screen.
+    """
     try:
-        cal = await asyncio.to_thread(
-            service.calendars().get(calendarId=calendar_id).execute
+        listing = await asyncio.to_thread(
+            service.events()
+            .list(calendarId=calendar_id, maxResults=1, fields="timeZone")
+            .execute
         )
-    except Exception as e:  # noqa: BLE001 - any failure falls back to UTC
+    except Exception as e:  # noqa: BLE001 - unreadable: leave the time as sent
         logger.warning(f"[calendar] Could not read the time zone of '{calendar_id}': {e}")
         return None
-    return cal.get("timeZone") or None
+    return listing.get("timeZone") or None
 
 
 async def _fill_missing_time_zone(
@@ -52,7 +60,8 @@ async def _fill_missing_time_zone(
     Aize: Google rejects a date-time without an offset unless the event names a time zone
     ("Missing time zone definition for start time"). Models often send local wall-clock times,
     which cost the user a string of failed calls. Read such times in the calendar's own time
-    zone (what the Calendar UI does), falling back to UTC when it cannot be read.
+    zone, as the Calendar UI does. When that zone cannot be read, nothing is guessed: the time
+    goes to Google as sent and fails loudly rather than landing at the wrong hour.
     """
     naive = [
         part
@@ -64,7 +73,9 @@ async def _fill_missing_time_zone(
     ]
     if not naive:
         return
-    tz = await _calendar_time_zone(service, calendar_id) or "UTC"
+    tz = await _calendar_time_zone(service, calendar_id)
+    if not tz:
+        return
     for part in naive:
         event_body[part]["timeZone"] = tz
     logger.info(f"[{tool_name}] No offset on {', '.join(naive)}; using time zone {tz}")

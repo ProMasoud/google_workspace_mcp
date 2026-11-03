@@ -16,12 +16,13 @@ def _fn(tool):
     return inspect.unwrap(getattr(tool, "fn", tool))
 
 
-def _service(calendar_tz="Asia/Tehran", calendars_get_error=None):
+def _service(calendar_tz="Asia/Tehran", zone_read_error=None):
     service = MagicMock()
-    if calendars_get_error:
-        service.calendars().get().execute.side_effect = calendars_get_error
+    # The zone is read from events.list, which the calendar.events scope allows.
+    if zone_read_error:
+        service.events().list().execute.side_effect = zone_read_error
     else:
-        service.calendars().get().execute.return_value = {"timeZone": calendar_tz}
+        service.events().list().execute.return_value = {"timeZone": calendar_tz}
     service.events().insert().execute.return_value = {"id": "e1", "htmlLink": "https://cal/e1"}
     service.events().get().execute.return_value = {"id": "e1", "summary": "Old"}
     service.events().update().execute.return_value = {"id": "e1", "htmlLink": "https://cal/e1"}
@@ -38,6 +39,9 @@ def _inserted_body(service):
     [
         ("2026-11-04T10:00:00", True),
         ("2026-11-04T10:00", True),
+        ("2026-11-04T10:00:00.000", True),
+        ("2026-11-04T10:00:00.000Z", False),
+        ("2026-11-04T10:00:00.123+03:30", False),
         ("2026-11-04T10:00:00Z", False),
         ("2026-11-04T10:00:00-05:00", False),
         ("2026-11-04T10:00:00+0330", False),
@@ -64,8 +68,8 @@ async def test_create_event_uses_the_calendar_time_zone_for_naive_times():
 
 
 @pytest.mark.asyncio
-async def test_create_event_falls_back_to_utc_when_the_calendar_cannot_be_read():
-    service = _service(calendars_get_error=Exception("403"))
+async def test_create_event_guesses_nothing_when_the_zone_cannot_be_read():
+    service = _service(zone_read_error=Exception("403"))
     await _fn(ct.create_event)(
         service=service,
         user_google_email="demo@example.com",
@@ -73,7 +77,8 @@ async def test_create_event_falls_back_to_utc_when_the_calendar_cannot_be_read()
         start_time="2026-11-04T10:00:00",
         end_time="2026-11-04T10:30:00",
     )
-    assert _inserted_body(service)["start"]["timeZone"] == "UTC"
+    # Sent as given: Google fails loudly instead of the event landing at a guessed hour.
+    assert _inserted_body(service)["start"] == {"dateTime": "2026-11-04T10:00:00"}
 
 
 @pytest.mark.asyncio
@@ -118,3 +123,18 @@ async def test_modify_event_fills_the_zone_for_a_naive_new_start():
     sent = [b for b in sent if b]
     assert sent, "modify_event sent no body"
     assert sent[-1]["start"]["timeZone"] == "Asia/Tehran"
+
+
+@pytest.mark.asyncio
+async def test_the_zone_lookup_uses_events_list_not_calendars_get():
+    service = _service("Asia/Tehran")
+    await _fn(ct.create_event)(
+        service=service,
+        user_google_email="demo@example.com",
+        summary="Demo",
+        start_time="2026-11-04T10:00:00",
+        end_time="2026-11-04T10:30:00",
+    )
+    kwargs = service.events().list.call_args.kwargs
+    assert kwargs["calendarId"] == "primary" and kwargs["maxResults"] == 1
+    service.calendars().get.assert_not_called()
